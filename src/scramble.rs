@@ -8,6 +8,7 @@
 
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 fn xor<T, U>(mut left: T, right: U) -> T
 where
@@ -34,7 +35,7 @@ fn hash_password(output: &mut [u32; 2], password: &[u8]) {
     let mut add: u32 = 7;
     let mut nr2: u32 = 0x12345671;
 
-    let mut tmp: u32;
+    let mut tmp: u32 = 0;
 
     for x in password {
         if *x == b' ' || *x == b'\t' {
@@ -52,9 +53,33 @@ fn hash_password(output: &mut [u32; 2], password: &[u8]) {
 
     output[0] = nr & 0b01111111_11111111_11111111_11111111;
     output[1] = nr2 & 0b01111111_11111111_11111111_11111111;
+    nr.zeroize();
+    nr2.zeroize();
+    add.zeroize();
+    tmp.zeroize();
+}
+
+/// The mysql_old_password (pre-4.1) password hash: the two 31-bit words the server stores as the
+/// account's verifier. Spaces and tabs in `password` are skipped, as the server does.
+pub fn hash_323(password: &[u8]) -> [u32; 2] {
+    let mut output = [0_u32; 2];
+    hash_password(&mut output, password);
+    output
 }
 
 pub fn scramble_323(nonce: &[u8], password: &[u8]) -> Option<[u8; 8]> {
+    if password.is_empty() {
+        return None;
+    }
+    let mut hash_pass = hash_323(password);
+    let output = scramble_323_from_verifier(nonce, hash_pass);
+    hash_pass.zeroize();
+    Some(output)
+}
+
+/// The mysql_old_password scramble computed from the account's stored verifier (the output of
+/// [`hash_323`] for the password) instead of the password itself.
+pub fn scramble_323_from_verifier(nonce: &[u8], verifier: [u32; 2]) -> [u8; 8] {
     struct Rand323 {
         seed1: u32,
         seed2: u32,
@@ -79,34 +104,33 @@ pub fn scramble_323(nonce: &[u8], password: &[u8]) -> Option<[u8; 8]> {
         }
     }
 
-    let mut hash_pass = [0_u32; 2];
-    let mut hash_message = [0_u32; 2];
-
-    if password.is_empty() {
-        return None;
+    impl Drop for Rand323 {
+        fn drop(&mut self) {
+            self.seed1.zeroize();
+            self.seed2.zeroize();
+        }
     }
 
+    let mut hash_message = [0_u32; 2];
     let mut output = [0_u8; 8];
 
-    hash_password(&mut hash_pass, password);
     hash_password(&mut hash_message, nonce);
 
-    let mut rand_st = Rand323::init(
-        hash_pass[0] ^ hash_message[0],
-        hash_pass[1] ^ hash_message[1],
-    );
+    let mut rand_st = Rand323::init(verifier[0] ^ hash_message[0], verifier[1] ^ hash_message[1]);
+    hash_message.zeroize();
 
     for x in output.iter_mut() {
         *x = ((rand_st.my_rnd() * 31_f64).floor() + 64_f64) as u8;
     }
 
-    let extra = (rand_st.my_rnd() * 31_f64).floor() as u8;
+    let mut extra = (rand_st.my_rnd() * 31_f64).floor() as u8;
 
     for x in output.iter_mut() {
         *x ^= extra;
     }
+    extra.zeroize();
 
-    Some(output)
+    output
 }
 
 /// Scramble algorithm used in mysql_native_password.
@@ -267,5 +291,24 @@ mod test {
                 0x19, 0xb6, 0x8d, 0x2e,
             ]
         );
+    }
+
+    #[test]
+    fn hash_323_matches_the_server_verifier() {
+        // OLD_PASSWORD('password') = 5d2e19393cc5ef67
+        assert_eq!(hash_323(b"password"), [0x5d2e1939, 0x3cc5ef67]);
+        assert_eq!(hash_323(b"pass word\t"), hash_323(b"password"));
+    }
+
+    #[test]
+    fn scramble_323_from_verifier_matches_scramble_323() {
+        let nonce = b"abcdefgh";
+        for password in [&b"password"[..], b"x", b"G!ider27"] {
+            assert_eq!(
+                scramble_323(nonce, password),
+                Some(scramble_323_from_verifier(nonce, hash_323(password)))
+            );
+        }
+        assert_eq!(scramble_323(nonce, b""), None);
     }
 }
