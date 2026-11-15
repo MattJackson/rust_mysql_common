@@ -10,7 +10,7 @@ use bytes::{Buf, BufMut, BytesMut};
 
 use crate::{
     constants::DEFAULT_MAX_ALLOWED_PACKET,
-    proto::codec::{PacketCodec, error::PacketCodecError},
+    proto::codec::{CodecSink, PacketCodec, error::PacketCodecError},
 };
 
 use std::{
@@ -136,8 +136,7 @@ where
     /// `false` means, that the `dst` is empty and the stream is at eof.
     pub fn next_packet<U>(&mut self, dst: &mut U) -> Result<bool, PacketCodecError>
     where
-        U: AsRef<[u8]>,
-        U: BufMut,
+        U: CodecSink + ?Sized,
     {
         loop {
             if self.eof {

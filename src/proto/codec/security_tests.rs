@@ -34,11 +34,15 @@ unsafe impl GlobalAlloc for ObservedAllocator {
 static ALLOCATOR: ObservedAllocator = ObservedAllocator;
 
 fn watch(buf: &BytesMut) {
+    watch_ptr(buf.as_ptr(), buf.len());
+}
+
+fn watch_ptr(ptr: *const u8, len: usize) {
     assert_eq!(WATCHED.load(Ordering::SeqCst), 0);
     SAW_FREE.store(false, Ordering::SeqCst);
     NONZERO.store(usize::MAX, Ordering::SeqCst);
-    WATCHED_LEN.store(buf.len(), Ordering::SeqCst);
-    WATCHED.store(buf.as_ptr() as usize, Ordering::SeqCst);
+    WATCHED_LEN.store(len, Ordering::SeqCst);
+    WATCHED.store(ptr as usize, Ordering::SeqCst);
 }
 
 fn assert_wiped_before_free() {
@@ -128,6 +132,71 @@ fn security_growth_wipes_replaced_codec_storage() {
     assert_wiped_before_free();
     assert_eq!(&dst[..32], &[0x73; 32]);
     assert_eq!(&dst[36..], &payload);
+}
+
+#[test]
+fn security_vec_sink_growth_wipes_replaced_storage() {
+    let mut src = BytesMut::new();
+    packet_to_chunks(0, &mut &[0x42_u8; 64][..], &mut src);
+    let mut dst = Vec::with_capacity(32);
+    dst.extend_from_slice(&[0x73; 32]);
+    watch_ptr(dst.as_ptr(), dst.len());
+    assert_eq!(
+        ChunkDecoder::default()
+            .decode(&mut src, &mut dst, 1024)
+            .unwrap(),
+        Some(ChunkInfo::Last(0))
+    );
+    assert_wiped_before_free();
+    assert_eq!(&dst[..32], &[0x73; 32]);
+    assert_eq!(&dst[32..], &[0x42; 64]);
+}
+
+/// A caller-owned buffer that is neither a `Vec` nor a `BytesMut`.
+#[derive(Default)]
+struct Owned(Vec<u8>);
+
+impl CodecSource for Owned {
+    fn unread(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn release(&mut self, count: usize) {
+        self.0.drain(..count);
+    }
+}
+
+impl CodecSink for Owned {
+    fn written(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn written_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+
+    fn append_bytes(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+}
+
+#[test]
+fn caller_owned_buffers_carry_plain_and_compressed_packets() {
+    for compress in [false, true] {
+        let mut encoder = PacketCodec::default();
+        let mut decoder = PacketCodec::default();
+        if compress {
+            encoder.compress(Compression::default());
+            decoder.compress(Compression::default());
+        }
+        let payload: Vec<u8> = (0..300).map(|i| (i % 251) as u8).collect();
+        let mut wire = Owned::default();
+        encoder.encode(&mut &payload[..], &mut wire).unwrap();
+        let mut packet = Owned::default();
+        assert!(decoder.decode(&mut wire, &mut packet).unwrap());
+        assert_eq!(packet.0, payload);
+        assert!(wire.0.is_empty());
+    }
 }
 
 fn codec() -> CompPacketCodec {
