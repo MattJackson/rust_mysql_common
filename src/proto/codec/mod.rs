@@ -11,7 +11,9 @@
 pub use flate2::Compression;
 
 use byteorder::{ByteOrder, LittleEndian};
-use bytes::{Buf, BufMut, BytesMut};
+#[cfg(test)]
+use bytes::BufMut;
+use bytes::{Buf, BytesMut};
 use flate2::read::{ZlibDecoder, ZlibEncoder};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -42,6 +44,22 @@ fn reserve_wiping(buf: &mut BytesMut, additional: usize) {
     }
 }
 
+// The same for a `Vec` target: growth moves the live bytes into a fresh block
+// and erases the old one before it is freed.
+fn reserve_wiping_vec(buf: &mut Vec<u8>, additional: usize) {
+    if additional > buf.capacity() - buf.len() {
+        let required = buf
+            .len()
+            .checked_add(additional)
+            .expect("buffer capacity overflow");
+        let capacity = buf.capacity().saturating_mul(2).max(required);
+        let mut replacement = Vec::with_capacity(capacity);
+        replacement.extend_from_slice(buf);
+        buf.zeroize();
+        *buf = replacement;
+    }
+}
+
 fn clear_wiping(buf: &mut BytesMut) {
     buf.as_mut().zeroize();
     buf.clear();
@@ -52,25 +70,105 @@ fn advance_wiping(buf: &mut BytesMut, count: usize) {
     buf.advance(count);
 }
 
+/// A buffer the codec decodes from: it reads the unread bytes and releases a
+/// consumed prefix.
+///
+/// Implement it for a buffer that must not keep what it releases (the
+/// implementations here wipe the released prefix).
+pub trait CodecSource {
+    /// The bytes not yet consumed.
+    fn unread(&self) -> &[u8];
+    /// Releases the first `count` unread bytes.
+    fn release(&mut self, count: usize);
+}
+
+/// A buffer the codec writes into: decoded payloads and encoded packets are
+/// appended to it, and a compressed packet's header is patched in place.
+///
+/// Implement it for a buffer that must not keep what it holds after growing
+/// (the implementations here move the live bytes into a fresh block and wipe
+/// the old one).
+pub trait CodecSink {
+    /// The bytes written so far.
+    fn written(&self) -> &[u8];
+    /// The bytes written so far, to patch in place.
+    fn written_mut(&mut self) -> &mut [u8];
+    /// Appends `bytes`.
+    fn append_bytes(&mut self, bytes: &[u8]);
+    /// Room for `additional` more bytes before the next growth (a hint).
+    fn reserve_bytes(&mut self, additional: usize) {
+        let _ = additional;
+    }
+}
+
+impl CodecSource for BytesMut {
+    fn unread(&self) -> &[u8] {
+        self
+    }
+
+    fn release(&mut self, count: usize) {
+        advance_wiping(self, count);
+    }
+}
+
+impl CodecSink for BytesMut {
+    fn written(&self) -> &[u8] {
+        self
+    }
+
+    fn written_mut(&mut self) -> &mut [u8] {
+        self
+    }
+
+    fn append_bytes(&mut self, bytes: &[u8]) {
+        reserve_wiping(self, bytes.len());
+        self.extend_from_slice(bytes);
+    }
+
+    fn reserve_bytes(&mut self, additional: usize) {
+        reserve_wiping(self, additional);
+    }
+}
+
+impl CodecSink for Vec<u8> {
+    fn written(&self) -> &[u8] {
+        self
+    }
+
+    fn written_mut(&mut self) -> &mut [u8] {
+        self
+    }
+
+    fn append_bytes(&mut self, bytes: &[u8]) {
+        reserve_wiping_vec(self, bytes.len());
+        self.extend_from_slice(bytes);
+    }
+
+    fn reserve_bytes(&mut self, additional: usize) {
+        reserve_wiping_vec(self, additional);
+    }
+}
+
 /// Will split given `packet` to MySql packet chunks and write into `dst`.
 ///
 /// Chunk ids will start with given `seq_id`.
 ///
 /// Resulting sequence id will be returned.
-pub fn packet_to_chunks<T: Buf>(mut seq_id: u8, packet: &mut T, dst: &mut BytesMut) -> u8 {
+pub fn packet_to_chunks<T: Buf, D: CodecSink + ?Sized>(
+    mut seq_id: u8,
+    packet: &mut T,
+    dst: &mut D,
+) -> u8 {
     let extra_packet = packet.remaining().is_multiple_of(MAX_PAYLOAD_LEN);
-    reserve_wiping(
-        dst,
-        packet.remaining() + (packet.remaining() / MAX_PAYLOAD_LEN) * 4 + 4,
-    );
+    dst.reserve_bytes(packet.remaining() + (packet.remaining() / MAX_PAYLOAD_LEN) * 4 + 4);
 
     while packet.has_remaining() {
         let mut chunk_len = min(packet.remaining(), MAX_PAYLOAD_LEN);
-        dst.put_u32_le(chunk_len as u32 | (u32::from(seq_id) << 24));
+        dst.append_bytes(&(chunk_len as u32 | (u32::from(seq_id) << 24)).to_le_bytes());
         while chunk_len > 0 {
             let chunk = packet.chunk();
             let count = min(chunk.len(), chunk_len);
-            dst.put(&chunk[..count]);
+            dst.append_bytes(&chunk[..count]);
             chunk_len -= count;
             packet.advance(count);
         }
@@ -78,7 +176,7 @@ pub fn packet_to_chunks<T: Buf>(mut seq_id: u8, packet: &mut T, dst: &mut BytesM
     }
 
     if extra_packet {
-        dst.put_u32_le(u32::from(seq_id) << 24);
+        dst.append_bytes(&(u32::from(seq_id) << 24).to_le_bytes());
         seq_id = seq_id.wrapping_add(1);
     }
 
@@ -88,23 +186,23 @@ pub fn packet_to_chunks<T: Buf>(mut seq_id: u8, packet: &mut T, dst: &mut BytesM
 /// Will compress all data from `src` to `dst`.
 ///
 /// Compressed packets will start with given `seq_id`. Resulting sequence id will be returned.
-pub fn compress(
+pub fn compress<D: CodecSink + ?Sized>(
     mut seq_id: u8,
     compression: Compression,
     max_allowed_packet: usize,
     src: &mut BytesMut,
-    dst: &mut BytesMut,
+    dst: &mut D,
 ) -> Result<u8, PacketCodecError> {
     if src.is_empty() {
         return Ok(0);
     }
 
     for chunk in src.chunks(min(MAX_PAYLOAD_LEN, max_allowed_packet)) {
-        reserve_wiping(dst, 7 + chunk.len());
+        dst.reserve_bytes(7 + chunk.len());
 
         if compression != Compression::none() && chunk.len() >= MIN_COMPRESS_LENGTH {
-            let header = dst.len();
-            dst.extend_from_slice(&[0; 7]);
+            let header = dst.written().len();
+            dst.append_bytes(&[0; 7]);
             let mut encoder = ZlibEncoder::new(chunk, compression);
             let mut staging = Zeroizing::new([0_u8; 16 * 1024]);
             loop {
@@ -112,19 +210,20 @@ pub fn compress(
                 if count == 0 {
                     break;
                 }
-                reserve_wiping(dst, count);
-                dst.extend_from_slice(&staging[..count]);
+                dst.append_bytes(&staging[..count]);
                 staging.zeroize();
             }
-            let compressed_len = dst.len() - header - 7;
-            LittleEndian::write_u24(&mut dst[header..header + 3], compressed_len as u32);
-            dst[header + 3] = seq_id;
-            LittleEndian::write_u24(&mut dst[header + 4..header + 7], chunk.len() as u32);
+            let compressed_len = dst.written().len() - header - 7;
+            let out = &mut dst.written_mut()[header..header + 7];
+            LittleEndian::write_u24(&mut out[..3], compressed_len as u32);
+            out[3] = seq_id;
+            LittleEndian::write_u24(&mut out[4..7], chunk.len() as u32);
         } else {
-            dst.put_uint_le(chunk.len() as u64, 3);
-            dst.put_u8(seq_id);
-            dst.put_uint_le(0, 3);
-            dst.put_slice(chunk);
+            let mut header = [0_u8; 7];
+            LittleEndian::write_u24(&mut header[..3], chunk.len() as u32);
+            header[3] = seq_id;
+            dst.append_bytes(&header);
+            dst.append_bytes(chunk);
         }
 
         seq_id = seq_id.wrapping_add(1);
@@ -181,28 +280,28 @@ impl ChunkDecoder {
     /// If the `dst` buffer isn't empty then it is expected that it contains previous chunks
     /// of the same packet, or this function may erroneously report
     /// [`PacketCodecError::PacketTooLarge`] error.
-    pub fn decode<T>(
+    pub fn decode<S, T>(
         &mut self,
-        src: &mut BytesMut,
+        src: &mut S,
         dst: &mut T,
         max_allowed_packet: usize,
     ) -> Result<Option<ChunkInfo>, PacketCodecError>
     where
-        T: AsRef<[u8]>,
-        T: BufMut,
+        S: CodecSource + ?Sized,
+        T: CodecSink + ?Sized,
     {
         match *self {
             ChunkDecoder::Idle => {
-                if src.len() < 4 {
+                if src.unread().len() < 4 {
                     // We need at least 4 bytes to read chunk length and sequence id.
                     Ok(None)
                 } else {
-                    let raw_chunk_len = LittleEndian::read_u24(&*src) as usize;
-                    let seq_id = src[3];
+                    let raw_chunk_len = LittleEndian::read_u24(src.unread()) as usize;
+                    let seq_id = src.unread()[3];
 
                     match NonZeroUsize::new(raw_chunk_len) {
                         Some(chunk_len) => {
-                            if dst.as_ref().len() + chunk_len.get() > max_allowed_packet {
+                            if dst.written().len() + chunk_len.get() > max_allowed_packet {
                                 return Err(PacketCodecError::PacketTooLarge);
                             }
 
@@ -211,27 +310,27 @@ impl ChunkDecoder {
                                 needed: chunk_len,
                             };
 
-                            if src.len() > 4 {
+                            if src.unread().len() > 4 {
                                 self.decode(src, dst, max_allowed_packet)
                             } else {
                                 Ok(None)
                             }
                         }
                         None => {
-                            advance_wiping(src, 4);
+                            src.release(4);
                             Ok(Some(ChunkInfo::Last(seq_id)))
                         }
                     }
                 }
             }
             ChunkDecoder::Chunk { seq_id, needed } => {
-                if src.len() >= 4 + needed.get() {
-                    dst.put_slice(&src[4..4 + needed.get()]);
-                    advance_wiping(src, 4 + needed.get());
+                if src.unread().len() >= 4 + needed.get() {
+                    dst.append_bytes(&src.unread()[4..4 + needed.get()]);
+                    src.release(4 + needed.get());
 
                     *self = ChunkDecoder::Idle;
 
-                    if dst.as_ref().len() % MAX_PAYLOAD_LEN == 0 {
+                    if dst.written().len() % MAX_PAYLOAD_LEN == 0 {
                         Ok(Some(ChunkInfo::Middle(seq_id)))
                     } else {
                         Ok(Some(ChunkInfo::Last(seq_id)))
@@ -306,21 +405,21 @@ impl CompDecoder {
     /// Will try to decode compressed packet from `src` into `dst`.
     ///
     /// If packet is decoded, then `ChunkInfo::Last` is returned.
-    pub fn decode(
+    pub fn decode<S: CodecSource + ?Sized>(
         &mut self,
-        src: &mut BytesMut,
+        src: &mut S,
         dst: &mut BytesMut,
         max_allowed_packet: usize,
     ) -> Result<Option<ChunkInfo>, PacketCodecError> {
         match *self {
             CompDecoder::Idle => {
-                if src.len() < 7 {
+                if src.unread().len() < 7 {
                     // We need at least 7 bytes to read compressed packet header.
                     Ok(None)
                 } else {
-                    let compressed_len = LittleEndian::read_u24(&*src) as usize;
-                    let seq_id = src[3];
-                    let uncompressed_len = LittleEndian::read_u24(&src[4..]) as usize;
+                    let compressed_len = LittleEndian::read_u24(src.unread()) as usize;
+                    let seq_id = src.unread()[3];
+                    let uncompressed_len = LittleEndian::read_u24(&src.unread()[4..]) as usize;
 
                     match CompData::new(compressed_len, uncompressed_len, max_allowed_packet)? {
                         Some(needed) => {
@@ -328,30 +427,30 @@ impl CompDecoder {
                             self.decode(src, dst, max_allowed_packet)
                         }
                         None => {
-                            advance_wiping(src, 7);
+                            src.release(7);
                             Ok(Some(ChunkInfo::Last(seq_id)))
                         }
                     }
                 }
             }
             CompDecoder::Packet { seq_id, needed } => {
-                if src.len() >= 7 + needed.needed() {
+                if src.unread().len() >= 7 + needed.needed() {
                     match needed {
                         CompData::Uncompressed(needed) => {
                             reserve_wiping(dst, needed.get());
-                            dst.extend_from_slice(&src[7..7 + needed.get()]);
+                            dst.extend_from_slice(&src.unread()[7..7 + needed.get()]);
                         }
                         CompData::Compressed(needed, plain_len) => {
                             // Keep partial output initialized and owned on malformed input.
                             // A failed read must not leave plaintext in spare capacity.
                             let mut staging = Zeroizing::new(vec![0_u8; plain_len.get()]);
-                            let mut decoder = ZlibDecoder::new(&src[7..7 + needed.get()]);
+                            let mut decoder = ZlibDecoder::new(&src.unread()[7..7 + needed.get()]);
                             decoder.read_exact(&mut staging)?;
                             reserve_wiping(dst, staging.len());
                             dst.extend_from_slice(&staging);
                         }
                     }
-                    advance_wiping(src, 7 + needed.needed());
+                    src.release(7 + needed.needed());
                     *self = CompDecoder::Idle;
                     Ok(Some(ChunkInfo::Last(seq_id)))
                 } else {
@@ -395,19 +494,19 @@ impl PacketCodec {
     ///
     /// * `true` - decoded packet was written into the `dst`,
     /// * `false` - `src` did not contain a full packet.
-    pub fn decode<T>(&mut self, src: &mut BytesMut, dst: &mut T) -> Result<bool, PacketCodecError>
+    pub fn decode<S, T>(&mut self, src: &mut S, dst: &mut T) -> Result<bool, PacketCodecError>
     where
-        T: AsRef<[u8]>,
-        T: BufMut,
+        S: CodecSource + ?Sized,
+        T: CodecSink + ?Sized,
     {
         self.inner.decode(src, dst, self.max_allowed_packet)
     }
 
     /// Will encode packets into `dst`.
-    pub fn encode<T: Buf>(
+    pub fn encode<T: Buf, D: CodecSink + ?Sized>(
         &mut self,
         src: &mut T,
-        dst: &mut BytesMut,
+        dst: &mut D,
     ) -> Result<(), PacketCodecError> {
         self.inner.encode(src, dst, self.max_allowed_packet)
     }
@@ -468,15 +567,15 @@ impl PacketCodecInner {
     /// Will try to decode packet from `src` into `dst`.
     ///
     /// If `true` is returned then `dst` contains full packet.
-    fn decode<T>(
+    fn decode<S, T>(
         &mut self,
-        src: &mut BytesMut,
+        src: &mut S,
         dst: &mut T,
         max_allowed_packet: usize,
     ) -> Result<bool, PacketCodecError>
     where
-        T: AsRef<[u8]>,
-        T: BufMut,
+        S: CodecSource + ?Sized,
+        T: CodecSink + ?Sized,
     {
         match self {
             PacketCodecInner::Plain(codec) => codec.decode(src, dst, max_allowed_packet, None),
@@ -485,10 +584,10 @@ impl PacketCodecInner {
     }
 
     /// Will try to encode packets into `dst`.
-    fn encode<T: Buf>(
+    fn encode<T: Buf, D: CodecSink + ?Sized>(
         &mut self,
         packet: &mut T,
-        dst: &mut BytesMut,
+        dst: &mut D,
         max_allowed_packet: usize,
     ) -> Result<(), PacketCodecError> {
         match self {
@@ -524,16 +623,16 @@ impl PlainPacketCodec {
     /// * `comp_seq_id` - is the sequence id of the last compressed packet (if any).
     ///
     /// If `true` is returned then `dst` contains full packet.
-    fn decode<T>(
+    fn decode<S, T>(
         &mut self,
-        src: &mut BytesMut,
+        src: &mut S,
         dst: &mut T,
         max_allowed_packet: usize,
         comp_seq_id: Option<u8>,
     ) -> Result<bool, PacketCodecError>
     where
-        T: AsRef<[u8]>,
-        T: BufMut,
+        S: CodecSource + ?Sized,
+        T: CodecSink + ?Sized,
     {
         match self.chunk_decoder.decode(src, dst, max_allowed_packet)? {
             Some(chunk_info) => {
@@ -553,7 +652,7 @@ impl PlainPacketCodec {
 
                 match chunk_info {
                     ChunkInfo::Middle(_) => {
-                        if !src.is_empty() {
+                        if !src.unread().is_empty() {
                             self.decode(src, dst, max_allowed_packet, comp_seq_id)
                         } else {
                             Ok(false)
@@ -567,10 +666,10 @@ impl PlainPacketCodec {
     }
 
     /// Will try to encode packets into `dst`.
-    fn encode<T: Buf>(
+    fn encode<T: Buf, D: CodecSink + ?Sized>(
         &mut self,
         packet: &mut T,
-        dst: &mut BytesMut,
+        dst: &mut D,
         max_allowed_packet: usize,
     ) -> Result<(), PacketCodecError> {
         if packet.remaining() > max_allowed_packet {
@@ -631,15 +730,15 @@ impl CompPacketCodec {
     /// Will try to decode packet from `src` into `dst`.
     ///
     /// If `true` is returned then `dst` contains full packet.
-    fn decode<T>(
+    fn decode<S, T>(
         &mut self,
-        src: &mut BytesMut,
+        src: &mut S,
         dst: &mut T,
         max_allowed_packet: usize,
     ) -> Result<bool, PacketCodecError>
     where
-        T: AsRef<[u8]>,
-        T: BufMut,
+        S: CodecSource + ?Sized,
+        T: CodecSink + ?Sized,
     {
         if !self.in_buf.is_empty()
             && self.plain_codec.decode(
@@ -677,10 +776,10 @@ impl CompPacketCodec {
     }
 
     /// Will try to encode packets into `dst`.
-    fn encode<T: Buf>(
+    fn encode<T: Buf, D: CodecSink + ?Sized>(
         &mut self,
         packet: &mut T,
-        dst: &mut BytesMut,
+        dst: &mut D,
         max_allowed_packet: usize,
     ) -> Result<(), PacketCodecError> {
         let result = self
