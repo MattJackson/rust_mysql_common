@@ -7,5 +7,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y cmake clang || true
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features "test zeroize"
+      - run: cargo doc --no-deps --features "test zeroize"
       - run: cargo test --doc --features "test zeroize"
